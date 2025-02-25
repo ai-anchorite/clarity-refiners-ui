@@ -5,32 +5,36 @@ import pillow_heif
 import torch
 import devicetorch
 import subprocess
+import tempfile
 import gc
 import psutil  # for system stats - gpu/cpu etc
 import random
 import shutil
+import threading
 
 from PIL import Image
-from typing import List
+from typing import List, Optional
 from pathlib import Path
 from datetime import datetime
 from gradio_imageslider import ImageSlider
 from huggingface_hub import hf_hub_download
 from transformers import AutoModelForCausalLM, AutoProcessor
 
-from refiners.fluxion.utils import manual_seed
 from refiners.foundationals.latent_diffusion import Solver, solvers
 from enhancer import ESRGANUpscaler, ESRGANUpscalerCheckpoints
+
 from system_monitor import SystemMonitor
 from message_manager import MessageManager
+from video_processor import VideoProcessor
+from refiners.fluxion.utils import manual_seed  # Add this import
 
 import warnings
-# Filter out the timm deprecation warning
-warnings.filterwarnings("ignore", category=FutureWarning, module="timm.models.layers")
-# Filter the GenerationMixin inheritance warning
-warnings.filterwarnings("ignore", message=".*has generative capabilities.*")
-# Filter the PyTorch flash attention warning
-warnings.filterwarnings("ignore", message=".*Torch was not compiled with flash attention.*")
+# # Filter out the timm deprecation warning
+# warnings.filterwarnings("ignore", category=FutureWarning, module="timm.models.layers")
+# # Filter the GenerationMixin inheritance warning
+# warnings.filterwarnings("ignore", message=".*has generative capabilities.*")
+# # Filter the PyTorch flash attention warning
+# warnings.filterwarnings("ignore", message=".*Torch was not compiled with flash attention.*")
 
 pillow_heif.register_heif_opener()
 pillow_heif.register_avif_opener()
@@ -73,13 +77,13 @@ CHECKPOINTS = ESRGANUpscalerCheckpoints(
             revision="48ced6ff8bfa873a8976fa467c3629a240643387",
         )
     ),
-    esrgan=Path(
-        hf_hub_download(
-            repo_id="philz1337x/upscaler",
-            filename="4x-UltraSharp.pth",
-            revision="011deacac8270114eb7d2eeff4fe6fa9a837be70",
-        )
-    ),
+    # esrgan=Path(
+        # hf_hub_download(
+            # repo_id="philz1337x/upscaler",
+            # filename="4x-UltraSharp.pth",
+            # revision="011deacac8270114eb7d2eeff4fe6fa9a837be70",
+        # )
+    # ),
     negative_embedding=Path(
         hf_hub_download(
             repo_id="philz1337x/embeddings",
@@ -104,6 +108,51 @@ CHECKPOINTS = ESRGANUpscalerCheckpoints(
                 revision="a3802c0280c0d00c2ab18d37454a8744c44e474e",
             )
         ),
+    },
+    esrgan_models={
+        "4x-UltraSharp": Path(
+            hf_hub_download(
+                repo_id="philz1337x/upscaler",
+                filename="4x-UltraSharp.pth",
+                revision="011deacac8270114eb7d2eeff4fe6fa9a837be70",
+            )
+        ),
+        "4x_foolhardy_Remacri": Path(
+            hf_hub_download(
+                repo_id="philz1337x/upscaler",
+                filename="4x_foolhardy_Remacri.pth", 
+                revision="076ac32b267863e0f86d11a05109b7b6cfd2de68",
+            )
+        ),
+        "4x_NMKD-Superscale-SP_178000_G": Path(
+            hf_hub_download(
+                repo_id="gemasai/4x_NMKD-Superscale-SP_178000_G",
+                filename="4x_NMKD-Superscale-SP_178000_G.pth", 
+                revision="ecf220ff30d91515a97b7b9154badcf5c76323ef",
+            )
+        ),
+        "4x_NMKD-Siax_200k": Path(
+            hf_hub_download(
+                repo_id="gemasai/4x_NMKD-Siax_200k",
+                filename="4x_NMKD-Siax_200k.pth", 
+                revision="6a21e0d6db5fe699873c9d1a6ae05c7dfe038171",
+            )
+        ),
+        "x1_ITF_SkinDiffDetail_Lite_v1": Path(
+            hf_hub_download(
+                repo_id="gemasai/x1_ITF_SkinDiffDetail_Lite_v1",
+                filename="x1_ITF_SkinDiffDetail_Lite_v1.pth", 
+                revision="d96852260dcd8b39a0a4db62d674a81a2604adab",
+            )
+        ),
+        # "4xFaceUpDAT": Path(
+            # hf_hub_download(
+                # repo_id="Phips/4xFaceUpDAT",
+                # filename="4xFaceUpDAT.safetensors",
+                # revision="21e1b10f8edf91425b66c7ad953f35226fed4b26",
+            # )
+        # ),
+        # Add other models here
     },
 )
 
@@ -261,14 +310,17 @@ def get_seed(seed_value: int, reuse: bool) -> int:
     global last_seed
     
     if reuse and last_seed is not None:
+        message_manager.add_message(f"Reusing previous seed: {last_seed}")
         return last_seed
     
     if seed_value == -1:
-        generated_seed = random.randint(0, 10_000)
+        generated_seed = random.randint(0, 2**32 - 1)
         last_seed = generated_seed
+        message_manager.add_message(f"Generated random seed: {generated_seed}")
         return generated_seed
     
     last_seed = seed_value
+    message_manager.add_message(f"Using provided seed: {seed_value}")
     return seed_value
 
     
@@ -288,6 +340,9 @@ def process(
     num_inference_steps: int = 18,
     solver: str = "DDIM",
     auto_save_enabled: bool = True,  
+    downscale_image: bool = True,
+    downscale_size: int = 768,
+    upscaler_model: str = "4x-UltraSharp",
 ) -> tuple[Image.Image, Image.Image]:
     try:
         # Input validation
@@ -304,10 +359,14 @@ def process(
         devicetorch.empty_cache(torch)
         message_manager.add_message("Cleared GPU memory")
 
-        manual_seed(actual_seed)
         solver_type: type[Solver] = getattr(solvers, solver)
 
-        # Use no_grad context
+        enhancer.set_model(upscaler_model)
+
+        # Adjust inference steps if creativity is 0
+        actual_steps = 1 if denoise_strength <= 0 else num_inference_steps
+        message_manager.add_message(f"Inference steps: {actual_steps}")
+
         with torch.no_grad():
             message_manager.add_message("Processing image...")
             enhanced_image = enhancer.upscale(
@@ -320,9 +379,12 @@ def process(
                 condition_scale=condition_scale,
                 tile_size=(tile_height, tile_width),
                 denoise_strength=denoise_strength,
-                num_inference_steps=num_inference_steps,
+                num_inference_steps=actual_steps,  
                 loras_scale={"more_details": 0.5, "sdxl_render": 1.0},
                 solver_type=solver_type,
+                seed=actual_seed, 
+                downscale_image=downscale_image,
+                downscale_size=downscale_size,
             )
 
         global latest_result
@@ -361,6 +423,7 @@ def batch_process_images(
     denoise_strength: float = 0.35,
     num_inference_steps: int = 18,
     solver: str = "DDIM",
+    upscaler_model: str = "4x-UltraSharp",  # Add upscaler model parameter
     progress=gr.Progress()
 ) -> tuple[str, List[str], tuple[Image.Image, Image.Image]]:
     """
@@ -407,6 +470,12 @@ def batch_process_images(
         total_files = len(files)
         message_manager.add_message(f"Starting batch processing of {total_files} files")
         
+        # Set initial seed for batch
+        actual_seed = get_seed(seed, reuse_seed)
+        
+        # Set model at start of batch
+        enhancer.set_model(upscaler_model)
+        
         for i, file in enumerate(files, 1):
             try:
                 # Update progress
@@ -438,9 +507,12 @@ def batch_process_images(
                 gc.collect()
                 devicetorch.empty_cache(torch)
                 
-                # Process with the same parameters as single image processing
-                actual_seed = get_seed(seed, reuse_seed)
-                manual_seed(actual_seed)
+                # Update seed for each image if not reusing
+                if not reuse_seed:
+                    actual_seed = get_seed(-1, False)  # Generate new random seed
+                
+                message_manager.add_message(f"Processing with seed: {actual_seed}")
+                
                 solver_type: type[Solver] = getattr(solvers, solver)
                 
                 with torch.no_grad():
@@ -457,6 +529,9 @@ def batch_process_images(
                         num_inference_steps=num_inference_steps,
                         loras_scale={"more_details": 0.5, "sdxl_render": 1.0},
                         solver_type=solver_type,
+                        seed=actual_seed,
+                        downscale_image=True,  # Add downscaling parameters
+                        downscale_size=768,
                     )
                 
                 # Update the current image pair for the slider
@@ -604,6 +679,158 @@ def update_gallery() -> List[str]:
         return []
 
 
+# Video work-in-progress
+
+stop_video_processing = threading.Event()
+
+def stop_video():
+    """Stop video processing"""
+    stop_video_processing.set()
+    message_manager.add_message("Stopping video processing...")
+    return "Stopping... Please wait for current frame to complete."
+
+def update_video_info(video_file):
+    """Display video information when a file is uploaded"""
+    if video_file is None:
+        return
+        
+    processor = VideoProcessor("../outputs", message_manager)
+    try:
+        frame_count = processor.display_video_info(video_file.name)
+        if frame_count is not None:
+            processing_msg = f"\n🎬 Ready to process {frame_count} frames"
+            message_manager.add_message(processing_msg)
+            return processing_msg
+    except Exception as e:
+        message_manager.add_error(f"Error processing video info: {str(e)}")
+        return None
+        
+def process_video_and_update(
+    video_file,
+    prompt,
+    negative_prompt,
+    seed,
+    reuse_seed,
+    upscale_factor,
+    controlnet_scale,
+    controlnet_decay,
+    condition_scale,
+    tile_width,
+    tile_height,
+    denoise_strength,
+    num_inference_steps,
+    solver,
+    upscaler_model, 
+    progress=gr.Progress()
+):
+    """
+    Gradio wrapper for video processing
+    """
+    # Reset stop flag at start
+    stop_video_processing.clear()
+
+    if video_file is None:
+        message_manager.add_warning("No video file loaded")
+        return None, update_gallery(), "Please load a video file first!"
+        
+    processor = VideoProcessor("../outputs", message_manager)
+    
+    try:
+        # Prepare folders
+        video_folder, frames_in, frames_out = processor.prepare_video_processing(video_file)
+        
+        # Get frame count for progress
+        total_frames = processor.get_video_info(video_file.name)['frame_count']
+        progress(0, desc="Starting video processing...")
+
+        # Set ESRGAN model
+        enhancer.set_model(upscaler_model)
+        
+        # Extract frames
+        message_manager.add_message("Extracting frames...")
+        frame_paths = processor.extract_frames(video_file.name, frames_in)
+        progress(0.1, desc="Frames extracted")
+        
+        # Process frames
+        solver_type = getattr(solvers, solver)
+        actual_seed = get_seed(seed, reuse_seed)
+        manual_seed(actual_seed)  # Now this will work
+        
+        # Calculate progress increment per frame
+        frame_progress = 0.8 / total_frames  # 80% of progress bar for frame processing
+        
+        # Initial status update
+        status = f"Processing {total_frames} frames..."
+        current_image_pair = (None, None)
+        
+        for i, frame_path in enumerate(frame_paths, 1):
+            # Check stop flag
+            if stop_video_processing.is_set():
+                message_manager.add_warning("Video processing stopped by user")
+                yield current_image_pair, update_gallery(), "Processing stopped by user"
+                return
+
+            input_image = Image.open(frame_path).convert("RGB")
+            gc.collect()
+            devicetorch.empty_cache(torch)
+            
+            current_progress = 0.1 + (i * frame_progress)
+            progress(current_progress, desc=f"Processing frame {i}/{total_frames}")
+            message_manager.add_message(f"Processing frame {i}/{total_frames}")
+            status = f"Processing frame {i}/{total_frames}"
+            
+            # Update seed for each frame if not reusing
+            if not reuse_seed:
+                actual_seed = get_seed(-1, False)
+                
+            with torch.no_grad():
+                enhanced_frame = enhancer.upscale(
+                    image=input_image,
+                    prompt=prompt,
+                    negative_prompt=negative_prompt,
+                    upscale_factor=upscale_factor,
+                    controlnet_scale=controlnet_scale,
+                    controlnet_scale_decay=controlnet_decay,
+                    condition_scale=condition_scale,
+                    tile_size=(tile_height, tile_width),
+                    denoise_strength=denoise_strength,
+                    num_inference_steps=num_inference_steps,
+                    loras_scale={"more_details": 0.5, "sdxl_render": 1.0},
+                    solver_type=solver_type,
+                    seed=actual_seed,
+                    downscale_image=True,
+                    downscale_size=768,
+                )
+            
+            output_path = os.path.join(frames_out, f"frame_{i:04d}_enhanced.png")
+            enhanced_frame.save(output_path, "PNG")
+            
+            current_image_pair = (input_image, enhanced_frame)
+            # Update all outputs: slider, gallery, and status
+            yield current_image_pair, update_gallery(), status
+        
+        # Reassemble video
+        progress(0.9, desc="Reassembling video...")
+        status = "Reassembling video..."
+        message_manager.add_message("Reassembling video...")
+        yield current_image_pair, update_gallery(), status
+        
+        output_video = os.path.join(video_folder, f"enhanced_video.mp4")
+        processor.reassemble_video(frames_out, output_video, video_file.name)
+        
+        progress(1.0, desc="Complete!")
+        final_status = f"Video processing complete! Saved to: {output_video}"
+        message_manager.add_success(final_status)
+        
+        # Final yield with completion status
+        yield current_image_pair, update_gallery(), final_status
+        
+    except Exception as e:
+        error_msg = f"Error processing video: {str(e)}"
+        message_manager.add_error(error_msg)
+        yield None, update_gallery(), error_msg
+
+        
 css = """
 
 /* Specific adjustments for Image */
@@ -612,6 +839,8 @@ css = """
     max-height: 80vh !important;
     width: auto !important;
     height: auto !important;
+    object-fit: contain !important;
+    object-position: center !important;
 }
 
 /* Center the ImageSlider container and maintain full width for slider */
@@ -706,7 +935,41 @@ with gr.Blocks(css=css) as demo:
                         "Process Batch",
                         variant="primary"
                     )
-           
+                with gr.TabItem("Video Upscale") as video_tab:
+                    video_welcome = """✨ Welcome to Video Processing! ✨
+
+                📽️ Drop a video file to enhance it frame by frame:
+                    
+                • Video will be split into frames and enhanced
+                • All enhancement settings will be applied to each frame
+                • Progress appears in the before/after slider
+                • Enhanced video saved to outputs folder
+                • Track progress in main console
+
+                ⚠️ Experimental Feature:
+                • Currently limited to short test videos
+                • Processing may take some time
+                • No audio handling yet
+
+                🎬 Ready? Drop a video file and click 'Process Video'!"""
+
+                    input_video = gr.File(
+                        file_count="single",
+                        label="Load Video",
+                        file_types=["video"],
+                    )
+                    video_status = gr.Textbox(
+                        label="Video Processing Status",
+                        value=video_welcome,
+                        interactive=False,
+                        show_copy_button=True,
+                        autoscroll=True,
+                        elem_classes="batch-status"
+                    )
+                    with gr.Row():
+                        video_button = gr.Button("Process Video", variant="primary")
+                        stop_button = gr.Button("Stop Processing", variant="stop")
+                    
         with gr.Column(elem_classes="image-container"):
             output_slider = ImageSlider(
                 interactive=False,
@@ -767,41 +1030,67 @@ with gr.Blocks(css=css) as demo:
                 label="Negative Prompt",
                 value="worst quality, low quality, normal quality",
             )
-        with gr.Row():
-            with gr.Column(scale=8):
-                seed = gr.Slider(
-                    minimum=-1,
-                    maximum=10_000,
-                    step=1,
-                    value=-1,
-                    label="Seed (-1 for random)"
-                )
-            with gr.Column(scale=1):
-                reuse_seed = gr.Checkbox(label="Reuse previous seed", value=False)
                 
-    with gr.Accordion("Options", open=False):
-        with gr.Row():    
-            upscale_factor = gr.Slider(
-                minimum=1,
-                maximum=4,
-                value=2,
-                step=0.2,
-                label="Upscale Factor",
+    with gr.Accordion("Options", open=True):
+        with gr.Row():
+            upscaler_model = gr.Dropdown(
+                choices=list(CHECKPOINTS.esrgan_models.keys()),
+                value="4x-UltraSharp",
+                label="Upscaler Model"
             )
-            denoise_strength = gr.Slider(
-                minimum=0.05,
-                maximum=1,
-                value=0.15,
-                step=0.05,
-                label="Denoise Strength", 
-                info="set to min for more traditional upscale",
+            downscale_image = gr.Checkbox(
+                label="Auto-resize",
+                value=True,
+                info="Resize input image to target size before upscaling"
             )
-            num_inference_steps = gr.Slider(
-                minimum=1,
-                maximum=50,
-                value=20,
+            downscale_size = gr.Slider(
+                minimum=512,
+                maximum=2048,
+                value=768,
+                step=256,
+                label="Target size for shortest side",
+                interactive=True,
+                visible=True
+            )    
+        with gr.Row(equal_height=True):    
+            with gr.Column():
+                upscale_factor = gr.Slider(
+                    minimum=1,
+                    maximum=8,
+                    value=2,
+                    step=0.5,
+                    label="Upscale Factor",
+                )
+            with gr.Column():
+                creativity = gr.Slider(  # Renamed from denoise_strength
+                    minimum=0,
+                    maximum=1,
+                    value=0.15,
+                    step=0.05,
+                    label="Creativity", 
+                    info="0 for pure upscaling, higher values add artistic enhancement",
+                )
+            with gr.Column():
+                num_inference_steps = gr.Slider(
+                    minimum=1,
+                    maximum=50,
+                    value=20,
+                    step=1,
+                    label="Number of Inference Steps",
+                )
+        with gr.Row():
+            seed = gr.Slider(
+                label="Seed (-1 = rnd)",
+                minimum=-1,
+                maximum=2**32 - 1,
                 step=1,
-                label="Number of Inference Steps",
+                value=-1,
+                scale=4,
+            )
+            reuse_seed = gr.Checkbox(
+                label="Reuse seed", 
+                value=False,
+                scale=1,
             )
     with gr.Accordion("Advanced Options", open=False):
         with gr.Row(): 
@@ -902,10 +1191,13 @@ with gr.Blocks(css=css) as demo:
             condition_scale,
             tile_width,
             tile_height,
-            denoise_strength,
+            creativity,
             num_inference_steps,
             solver,
             auto_save,
+            downscale_image,
+            downscale_size,
+            upscaler_model,
         ],
         outputs=[output_slider, gallery]
     )
@@ -924,11 +1216,46 @@ with gr.Blocks(css=css) as demo:
             condition_scale,
             tile_width,
             tile_height,
-            denoise_strength,
+            creativity,
             num_inference_steps,
             solver,
+            upscaler_model, 
         ],
         outputs=[batch_status, gallery, output_slider]
+    )
+
+    input_video.upload(
+        fn=update_video_info,
+        inputs=[input_video],
+        outputs=[video_status]
+    )
+ 
+    video_button.click(
+            fn=process_video_and_update,
+            inputs=[
+                input_video,
+                prompt,
+                negative_prompt,
+                seed,
+                reuse_seed,
+                upscale_factor,
+                controlnet_scale,
+                controlnet_decay,
+                condition_scale,
+                tile_width,
+                tile_height,
+                creativity,
+                num_inference_steps,
+                solver,
+                upscaler_model, 
+            ],
+            outputs=[output_slider, gallery, video_status] 
+        )
+        
+    stop_button.click(
+        fn=stop_video,
+        inputs=None,
+        outputs=[video_status],
     )
     
     save_result.click(
@@ -940,17 +1267,22 @@ with gr.Blocks(css=css) as demo:
     open_folder_button.click(
         fn=open_output_folder,
         inputs=None,
-        outputs=gr.Text(visible=False) 
+        outputs=None  # Remove the output entirely
     )
     
     def update_console():
         return message_manager.get_messages()
-    
+        
+    def update_monitor():
+        """Separate function for system monitoring to avoid folder opening"""
+        return SystemMonitor.get_system_info(), message_manager.get_messages()
+        
     # Initialize the timer and set up its tick event
     demo.load(
-        fn=lambda: (SystemMonitor.get_system_info(), update_console()),
+        fn=update_monitor,
         outputs=[resource_monitor, console_out],
-        every=1  # Updates every 1 second
+        every=2
     )
+    
     
 demo.launch(share=False)

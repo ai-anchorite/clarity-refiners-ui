@@ -94,11 +94,12 @@ class ShortcutBlock(nn.Module):
 
 
 class RRDBNet(nn.Module):
-    def __init__(self, in_nc: int, out_nc: int, nf: int, nb: int) -> None:
+    def __init__(self, in_nc: int, out_nc: int, nf: int, nb: int, scale: int = 4) -> None:
         super().__init__()  # type: ignore[reportUnknownMemberType]
         assert in_nc % 4 != 0  # in_nc is 3
 
-        self.model = nn.Sequential(
+        # Base layers
+        modules = [
             nn.Conv2d(in_nc, nf, kernel_size=3, padding=1),
             ShortcutBlock(
                 nn.Sequential(
@@ -106,23 +107,37 @@ class RRDBNet(nn.Module):
                     nn.Conv2d(nf, nf, kernel_size=3, padding=1),
                 )
             ),
-            Upsample2x(),
-            nn.Conv2d(nf, nf, kernel_size=3, padding=1),
-            nn.LeakyReLU(negative_slope=0.2, inplace=True),
-            Upsample2x(),
-            nn.Conv2d(nf, nf, kernel_size=3, padding=1),
-            nn.LeakyReLU(negative_slope=0.2, inplace=True),
+        ]
+
+        # Add upscale blocks for 2x and 4x models
+        if scale >= 2:
+            modules.extend([
+                Upsample2x(),
+                nn.Conv2d(nf, nf, kernel_size=3, padding=1),
+                nn.LeakyReLU(negative_slope=0.2, inplace=True),
+            ])
+        if scale >= 4:
+            modules.extend([
+                Upsample2x(),
+                nn.Conv2d(nf, nf, kernel_size=3, padding=1),
+                nn.LeakyReLU(negative_slope=0.2, inplace=True),
+            ])
+
+        # Final layers
+        modules.extend([
             nn.Conv2d(nf, nf, kernel_size=3, padding=1),
             nn.LeakyReLU(negative_slope=0.2, inplace=True),
             nn.Conv2d(nf, out_nc, kernel_size=3, padding=1),
-        )
+        ])
+
+        self.model = nn.Sequential(*modules)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.model(x)
 
 
 def infer_params(state_dict: dict[str, torch.Tensor]) -> tuple[int, int, int, int, int]:
-    # this code is adapted from https://github.com/victorca25/iNNfer
+    # Calculate scale factor by checking model architecture
     scale2x = 0
     scalemin = 6
     n_uplayer = 0
@@ -141,16 +156,15 @@ def infer_params(state_dict: dict[str, torch.Tensor]) -> tuple[int, int, int, in
             if part_num > n_uplayer:
                 n_uplayer = part_num
                 out_nc = state_dict[block].shape[0]
-        assert "conv1x1" not in block  # no ESRGANPlus
 
     nf = state_dict["model.0.weight"].shape[0]
     in_nc = state_dict["model.0.weight"].shape[1]
-    scale = 2**scale2x
+    scale = 2**scale2x if scale2x > 0 else 1  # If no upscale layers found, assume 1x
 
     assert out_nc > 0
     assert nb > 0
 
-    return in_nc, out_nc, nf, nb, scale  # 3, 3, 64, 23, 4
+    return in_nc, out_nc, nf, nb, scale
 
 
 Tile = tuple[int, int, Image.Image]
@@ -241,6 +255,11 @@ class UpscalerESRGAN:
     def __init__(self, model_path: Path, device: torch.device, dtype: torch.dtype):
         self.model_path = model_path
         self.device = device
+        # Get scale factor first
+        _, _, _, _, self.scale_factor = infer_params(
+            torch.load(model_path, weights_only=True, map_location=device)
+        )
+        # Now load model with correct scale factor
         self.model = self.load_model(model_path)
         self.to(device, dtype)
 
@@ -254,13 +273,12 @@ class UpscalerESRGAN:
 
     def load_model(self, path: Path) -> RRDBNet:
         filename = path
-        state_dict: dict[str, torch.Tensor] = torch.load(filename, weights_only=True, map_location=self.device)  # type: ignore
+        state_dict = torch.load(filename, weights_only=True, map_location=self.device)
         in_nc, out_nc, nf, nb, upscale = infer_params(state_dict)
-        assert upscale == 4, "Only 4x upscaling is supported"
-        model = RRDBNet(in_nc=in_nc, out_nc=out_nc, nf=nf, nb=nb)
+        # Pass scale factor to RRDBNet
+        model = RRDBNet(in_nc=in_nc, out_nc=out_nc, nf=nf, nb=nb, scale=upscale)
         model.load_state_dict(state_dict)
         model.eval()
-
         return model
 
     def upscale_without_tiling(self, img: Image.Image) -> Image.Image:

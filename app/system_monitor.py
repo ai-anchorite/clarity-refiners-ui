@@ -13,7 +13,7 @@ class SystemMonitor:
     def get_nvidia_gpu_info() -> Tuple[str, MetricsDict]:
         """Get NVIDIA GPU information and metrics."""
         metrics = {}
-        gpu_name = f"NVIDIA {torch.cuda.get_device_name(0)}"
+        gpu_name = f"{torch.cuda.get_device_name(0)}"
         
         try:
             result = subprocess.check_output([

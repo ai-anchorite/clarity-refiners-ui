@@ -5,6 +5,7 @@ pillow>=10.4.0
 pillow-heif>=0.18.0
 gradio==4.44.0
 devicetorch
+opencv-python>=4.8.0
 # for Florence-2
 transformers
 ftfy
