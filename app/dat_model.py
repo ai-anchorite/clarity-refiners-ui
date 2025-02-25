@@ -6,6 +6,7 @@ from PIL import Image
 import numpy as np
 from pathlib import Path
 from refiners.fluxion.utils import load_from_safetensors
+from esrgan_model import split_grid, combine_grid, Grid  # Import tiling functions at module level
 
 def make_layer(block, n_layers):
     layers = []
@@ -163,10 +164,7 @@ class UpscalerDAT:
         return Image.fromarray(output)
 
     def upscale_with_tiling(self, img: Image.Image) -> Image.Image:
-        # Use the same tiling logic as ESRGAN
-        # This can be imported from esrgan_model.py
-        from esrgan_model import split_grid, combine_grid, Grid
-        
+        # Use the tiling functions imported at module level
         img = img.convert("RGB")
         grid = split_grid(img)
         newtiles = []

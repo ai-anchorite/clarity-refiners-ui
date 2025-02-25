@@ -6,6 +6,7 @@ which is a copy of https://github.com/xinntao/ESRGAN
 """
 
 import math
+import traceback
 from pathlib import Path
 from typing import NamedTuple
 
@@ -164,6 +165,7 @@ def infer_params(state_dict: dict[str, torch.Tensor]) -> tuple[int, int, int, in
     assert out_nc > 0
     assert nb > 0
 
+    print(f"Inferred model parameters: in_nc={in_nc}, out_nc={out_nc}, nf={nf}, nb={nb}, scale={scale}")
     return in_nc, out_nc, nf, nb, scale
 
 
@@ -207,6 +209,7 @@ def split_grid(image: Image.Image, tile_w: int = 512, tile_h: int = 512, overlap
             row_images.append((x1, tile_w, tile))
         grid.tiles.append((y1, tile_h, row_images))
 
+    print(f"Split image {w}x{h} into {rows}x{cols} grid with tile size {tile_w}x{tile_h}")
     return grid
 
 
@@ -248,6 +251,7 @@ def combine_grid(grid: Grid):
             (0, y + grid.overlap),
         )
 
+    print(f"Combined grid into image of size {combined_image.width}x{combined_image.height}")
     return combined_image
 
 
@@ -255,23 +259,45 @@ class UpscalerESRGAN:
     def __init__(self, model_path: Path, device: torch.device, dtype: torch.dtype):
         self.model_path = model_path
         self.device = device
-        # Get scale factor first
-        _, _, _, _, self.scale_factor = infer_params(
-            torch.load(model_path, weights_only=True, map_location=device)
-        )
-        # Now load model with correct scale factor
-        self.model = self.load_model(model_path)
-        self.to(device, dtype)
+        print(f"Initializing ESRGAN model from {model_path}")
+        
+        try:
+            # Get scale factor first
+            state_dict = torch.load(model_path, weights_only=True, map_location="cpu")  # Load to CPU first
+            print(f"Loaded state dict with {len(state_dict)} keys")
+            
+            _, _, _, _, self.scale_factor = infer_params(state_dict)
+            print(f"Inferred scale factor: {self.scale_factor}")
+            
+            # Now load model with correct scale factor
+            self.model = self.load_model(model_path)
+            print(f"Model loaded successfully")
+            self.to(device, dtype)
+            
+            # Verify model works with a simple test
+            test_input = torch.randn(1, 3, 16, 16, device=device, dtype=dtype)
+            with torch.no_grad():
+                test_output = self.model(test_input)
+            expected_size = 16 * self.scale_factor
+            print(f"Model test: input 16x16 → output {test_output.shape[2]}x{test_output.shape[3]}")
+            if test_output.shape[2] != expected_size or test_output.shape[3] != expected_size:
+                print(f"WARNING: Model output size {test_output.shape[2]}x{test_output.shape[3]} doesn't match expected {expected_size}x{expected_size}")
+        except Exception as e:
+            print(f"Error initializing ESRGAN model: {str(e)}")
+            traceback.print_exc()
+            raise
 
     def __call__(self, img: Image.Image) -> Image.Image:
         return self.upscale_without_tiling(img)
 
     def to(self, device: torch.device, dtype: torch.dtype):
+        print(f"Moving ESRGAN model to {device} with dtype {dtype}")
         self.device = device
         self.dtype = dtype
         self.model.to(device=device, dtype=dtype)
 
     def load_model(self, path: Path) -> RRDBNet:
+        print(f"Loading ESRGAN model from {path}")
         filename = path
         state_dict = torch.load(filename, weights_only=True, map_location=self.device)
         in_nc, out_nc, nf, nb, upscale = infer_params(state_dict)
@@ -279,45 +305,126 @@ class UpscalerESRGAN:
         model = RRDBNet(in_nc=in_nc, out_nc=out_nc, nf=nf, nb=nb, scale=upscale)
         model.load_state_dict(state_dict)
         model.eval()
+        print(f"ESRGAN model loaded with scale factor {upscale}")
         return model
 
     def upscale_without_tiling(self, img: Image.Image) -> Image.Image:
-        img_np = np.array(img)
-        img_np = img_np[:, :, ::-1]
-        img_np = np.ascontiguousarray(np.transpose(img_np, (2, 0, 1))) / 255
-        img_t = torch.from_numpy(img_np).float()  # type: ignore
-        img_t = img_t.unsqueeze(0).to(device=self.device, dtype=self.dtype)
-        with torch.no_grad():
-            output = self.model(img_t)
-        output = output.squeeze().float().cpu().clamp_(0, 1).numpy()
-        output = 255.0 * np.moveaxis(output, 0, 2)
-        output = output.astype(np.uint8)
-        output = output[:, :, ::-1]
-        return Image.fromarray(output, "RGB")
+        print(f"Upscaling image without tiling: {img.width}x{img.height}")
+        try:
+            img_np = np.array(img)
+            img_np = img_np[:, :, ::-1]  # RGB to BGR
+            img_np = np.ascontiguousarray(np.transpose(img_np, (2, 0, 1))) / 255
+            img_t = torch.from_numpy(img_np).float()  # type: ignore
+            img_t = img_t.unsqueeze(0).to(device=self.device, dtype=self.dtype)
+            
+            print(f"Input tensor shape: {img_t.shape}, device: {img_t.device}, dtype: {img_t.dtype}")
+            
+            with torch.no_grad():
+                output = self.model(img_t)
+                
+            print(f"Output tensor shape: {output.shape}")
+            
+            output = output.squeeze().float().cpu().clamp_(0, 1).numpy()
+            output = 255.0 * np.moveaxis(output, 0, 2)
+            output = output.astype(np.uint8)
+            output = output[:, :, ::-1]  # BGR to RGB
+            result = Image.fromarray(output, "RGB")
+            
+            print(f"Upscaled to {result.width}x{result.height}")
+            return result
+        except Exception as e:
+            print(f"Error in upscale_without_tiling: {str(e)}")
+            traceback.print_exc()
+            raise
 
     # https://github.com/philz1337x/clarity-upscaler/blob/e0cd797198d1e0e745400c04d8d1b98ae508c73b/modules/esrgan_model.py#L208
     def upscale_with_tiling(self, img: Image.Image) -> Image.Image:
-        img = img.convert("RGB")
-        grid = split_grid(img)
-        newtiles: Tiles = []
-        scale_factor: int = 1
+        print(f"Upscaling image with tiling: {img.width}x{img.height}")
+        try:
+            img = img.convert("RGB")
+            grid = split_grid(img)
+            newtiles: Tiles = []
+            scale_factor: int = 1
 
-        for y, h, row in grid.tiles:
-            newrow: list[Tile] = []
-            for tiledata in row:
-                x, w, tile = tiledata
-                output = self.upscale_without_tiling(tile)
-                scale_factor = output.width // tile.width
-                newrow.append((x * scale_factor, w * scale_factor, output))
-            newtiles.append((y * scale_factor, h * scale_factor, newrow))
+            for y, h, row in grid.tiles:
+                newrow: list[Tile] = []
+                for tiledata in row:
+                    x, w, tile = tiledata
+                    print(f"Processing tile at ({x},{y}) with size {tile.width}x{tile.height}")
+                    output = self.upscale_without_tiling(tile)
+                    scale_factor = output.width // tile.width
+                    print(f"Tile upscaled to {output.width}x{output.height} (scale factor: {scale_factor})")
+                    newrow.append((x * scale_factor, w * scale_factor, output))
+                newtiles.append((y * scale_factor, h * scale_factor, newrow))
 
-        newgrid = Grid(
-            newtiles,
-            grid.tile_w * scale_factor,
-            grid.tile_h * scale_factor,
-            grid.image_w * scale_factor,
-            grid.image_h * scale_factor,
-            grid.overlap * scale_factor,
-        )
-        output = combine_grid(newgrid)
-        return output
+            newgrid = Grid(
+                newtiles,
+                grid.tile_w * scale_factor,
+                grid.tile_h * scale_factor,
+                grid.image_w * scale_factor,
+                grid.image_h * scale_factor,
+                grid.overlap * scale_factor,
+            )
+            output = combine_grid(newgrid)
+            print(f"Final combined output: {output.width}x{output.height}")
+            return output
+        except Exception as e:
+            print(f"Error in upscale_with_tiling: {str(e)}")
+            traceback.print_exc()
+            raise
+
+
+def test_esrgan_model(model_path, device=None):
+    """Test function to verify ESRGAN model is working correctly"""
+    from PIL import Image
+    import numpy as np
+    import torch
+    
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # Create a simple test image
+    test_img = Image.new('RGB', (64, 64), color=(128, 128, 128))
+    # Add some patterns to make upscaling visible
+    for i in range(64):
+        for j in range(64):
+            if (i + j) % 8 == 0:
+                test_img.putpixel((i, j), (255, 0, 0))
+            elif (i - j) % 8 == 0:
+                test_img.putpixel((i, j), (0, 255, 0))
+    
+    print(f"Testing ESRGAN model: {model_path}")
+    try:
+        # Initialize the model
+        upscaler = UpscalerESRGAN(model_path, device, torch.float32)
+        
+        # Test upscaling
+        print("Upscaling test image...")
+        result = upscaler.upscale_without_tiling(test_img)
+        
+        # Verify dimensions
+        expected_w = test_img.width * upscaler.scale_factor
+        expected_h = test_img.height * upscaler.scale_factor
+        
+        print(f"Original size: {test_img.width}x{test_img.height}")
+        print(f"Expected size: {expected_w}x{expected_h}")
+        print(f"Actual size: {result.width}x{result.height}")
+        
+        # Save test images
+        test_img.save("esrgan_test_input.png")
+        result.save("esrgan_test_output.png")
+        print("Test images saved to esrgan_test_input.png and esrgan_test_output.png")
+        
+        return True
+    except Exception as e:
+        print(f"Test failed: {str(e)}")
+        traceback.print_exc()
+        return False
+
+# Uncomment to run test when module is executed directly
+# if __name__ == "__main__":
+#     import sys
+#     if len(sys.argv) > 1:
+#         test_esrgan_model(Path(sys.argv[1]))
+#     else:
+#         print("Please provide path to ESRGAN model")

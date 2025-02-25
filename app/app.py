@@ -145,12 +145,12 @@ CHECKPOINTS = ESRGANUpscalerCheckpoints(
                 revision="d96852260dcd8b39a0a4db62d674a81a2604adab",
             )
         ),
-        # "4xFaceUpDAT": Path(
-            # hf_hub_download(
-                # repo_id="Phips/4xFaceUpDAT",
-                # filename="4xFaceUpDAT.safetensors",
-                # revision="21e1b10f8edf91425b66c7ad953f35226fed4b26",
-            # )
+        #"4xFaceUpDAT": Path(
+        #  hf_hub_download(
+        #        repo_id="Phips/4xFaceUpDAT",
+        #        filename="4xFaceUpDAT.safetensors",
+        #        revision="21e1b10f8edf91425b66c7ad953f35226fed4b26",
+        #    )
         # ),
         # Add other models here
     },
@@ -353,6 +353,7 @@ def process(
         actual_seed = get_seed(seed, reuse_seed)
         message_manager.add_message(f"Starting enhancement with seed {actual_seed}")
         message_manager.add_message(f"Upscale factor: {upscale_factor}x")
+        message_manager.add_message(f"Using upscaler model: {upscaler_model}")
         
         # Clear memory before processing
         gc.collect()
@@ -361,11 +362,18 @@ def process(
 
         solver_type: type[Solver] = getattr(solvers, solver)
 
-        enhancer.set_model(upscaler_model)
+        # Set the upscaler model
+        try:
+            enhancer.set_model(upscaler_model)
+            message_manager.add_success(f"Successfully set upscaler model to {upscaler_model}")
+        except Exception as e:
+            message_manager.add_error(f"Error setting upscaler model: {str(e)}")
+            return gr.Warning(f"Error setting upscaler model: {str(e)}")
 
         # Adjust inference steps if creativity is 0
         actual_steps = 1 if denoise_strength <= 0 else num_inference_steps
         message_manager.add_message(f"Inference steps: {actual_steps}")
+        message_manager.add_message(f"Creativity/denoise strength: {denoise_strength}")
 
         with torch.no_grad():
             message_manager.add_message("Processing image...")
@@ -387,6 +395,10 @@ def process(
                 downscale_size=downscale_size,
             )
 
+        # Check if the image was actually upscaled
+        message_manager.add_message(f"Original size: {input_image.width}x{input_image.height}")
+        message_manager.add_message(f"Enhanced size: {enhanced_image.width}x{enhanced_image.height}")
+        
         global latest_result
         latest_result = enhanced_image
         message_manager.add_success("Enhancement complete!")
@@ -830,6 +842,68 @@ def process_video_and_update(
         message_manager.add_error(error_msg)
         yield None, update_gallery(), error_msg
 
+def test_upscaler_models():
+    """Test all available upscaler models and report results"""
+    message_manager.add_message("Testing upscaler models...")
+    
+    # Create a small test image
+    test_img = Image.new('RGB', (64, 64), color=(128, 128, 128))
+    # Add some patterns to make upscaling visible
+    for i in range(64):
+        for j in range(64):
+            if (i + j) % 8 == 0:
+                test_img.putpixel((i, j), (255, 0, 0))
+            elif (i - j) % 8 == 0:
+                test_img.putpixel((i, j), (0, 255, 0))
+    
+    results = []
+    
+    for model_name in enhancer.esrgan_models.keys():
+        message_manager.add_message(f"Testing model: {model_name}")
+        try:
+            # Set the model
+            enhancer.set_model(model_name)
+            
+            # Test pure upscaling (no diffusion)
+            upscaled = enhancer.upscale(
+                image=test_img,
+                denoise_strength=0,  # Pure upscaling
+                upscale_factor=2,    # Target 2x upscale
+            )
+            
+            # Check results
+            expected_size = (test_img.width * 2, test_img.height * 2)
+            actual_size = (upscaled.width, upscaled.height)
+            
+            success = actual_size[0] > test_img.width  # At least some upscaling happened
+            
+            results.append({
+                "model": model_name,
+                "success": success,
+                "expected_size": expected_size,
+                "actual_size": actual_size
+            })
+            
+            if success:
+                message_manager.add_success(f"Model {model_name} upscaled successfully to {actual_size}")
+                # Save test result
+                upscaled.save(f"test_{model_name}.png")
+            else:
+                message_manager.add_error(f"Model {model_name} failed to upscale properly")
+                
+        except Exception as e:
+            message_manager.add_error(f"Error testing {model_name}: {str(e)}")
+            results.append({
+                "model": model_name,
+                "success": False,
+                "error": str(e)
+            })
+    
+    # Summary
+    success_count = sum(1 for r in results if r["success"])
+    message_manager.add_message(f"Test complete: {success_count}/{len(results)} models working")
+    
+    return str(results)  # Convert to string for display in textbox
         
 css = """
 
@@ -1169,6 +1243,11 @@ with gr.Blocks(css=css) as demo:
                 preview=True,
             )
             
+    with gr.Accordion("Developer Tools", open=False, visible=True):
+        with gr.Row():
+            test_models_btn = gr.Button("Test Upscaler Models")
+            test_result = gr.Textbox(label="Test Results", lines=10)
+    
     # Event handlers
     
     generate_prompt_btn.click(
@@ -1268,6 +1347,12 @@ with gr.Blocks(css=css) as demo:
         fn=open_output_folder,
         inputs=None,
         outputs=None  # Remove the output entirely
+    )
+    
+    test_models_btn.click(
+        fn=test_upscaler_models,
+        inputs=None,
+        outputs=[test_result]
     )
     
     def update_console():
